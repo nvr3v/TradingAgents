@@ -161,12 +161,16 @@ def backtest(
 
 
 # The plans `login` and `logout` take: the providers signed in to, not keyed.
-Plan = StrEnum("Plan", {name: name for name in SIGNED_IN_PROVIDERS})
+# ``tradingview`` is a data source signed in to (its hosted MCP server), not an LLM plan.
+Plan = StrEnum("Plan", {name: name for name in (*SIGNED_IN_PROVIDERS, "tradingview")})
 
 
 @app.command()
 def login(plan: Annotated[Plan, typer.Argument(help="The plan to sign in with")]):
-    """Sign in with your ChatGPT Plus or Pro plan, for the chatgpt provider."""
+    """Sign in with your ChatGPT Plus or Pro plan, or to TradingView for market data."""
+    if plan == "tradingview":
+        _login_tradingview()
+        return
     from tradingagents.llm_clients import chatgpt_auth
 
     try:
@@ -181,7 +185,11 @@ def login(plan: Annotated[Plan, typer.Argument(help="The plan to sign in with")]
 
 @app.command()
 def logout(plan: Annotated[Plan, typer.Argument(help="The plan to sign out of")]):
-    """Sign out of your ChatGPT plan: revoke this machine's access and forget it."""
+    """Sign out of your ChatGPT plan or TradingView: forget this machine's access."""
+    if plan == "tradingview":
+        from tradingagents.dataflows.vendors.tradingview_mcp import client as tv
+        console.print("Signed out of TradingView." if tv.sign_out() else "Not signed in to TradingView.")
+        return
     from tradingagents.llm_clients import chatgpt_auth
 
     outcome = chatgpt_auth.sign_out()
@@ -192,6 +200,17 @@ def logout(plan: Annotated[Plan, typer.Argument(help="The plan to sign out of")]
                       "it stays valid at OpenAI until it expires.[/yellow]")
     else:
         console.print("Not signed in to ChatGPT.")
+
+
+def _login_tradingview():
+    from tradingagents.dataflows.vendors.tradingview_mcp import client as tv
+
+    try:
+        tools = tv.sign_in(say=lambda line: console.print(line, soft_wrap=True, markup=False, highlight=False))
+    except tv.TradingViewMCPError as exc:
+        console.print(f"[red]{escape(str(exc))}[/red]")
+        raise typer.Exit(code=1) from None
+    console.print(f"[green]Signed in to TradingView ({len(tools)} tools available).[/green]")
 
 
 if __name__ == "__main__":

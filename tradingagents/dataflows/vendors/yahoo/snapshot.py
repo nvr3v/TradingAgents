@@ -10,6 +10,7 @@ claim. Deterministic, no LLM involved.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable
 
 import pandas as pd
@@ -20,12 +21,35 @@ from tradingagents.dataflows.symbols import normalize_symbol
 from tradingagents.dataflows.vendors.yahoo.common import price_text
 from tradingagents.dataflows.vendors.yahoo.ohlcv import load_ohlcv
 
+logger = logging.getLogger(__name__)
+
 # A fixed, common indicator set so the snapshot is the same shape every run.
 DEFAULT_SNAPSHOT_INDICATORS: tuple[str, ...] = (
     "close_10_ema", "close_50_sma", "close_200_sma",
     "rsi", "boll", "boll_ub", "boll_lb",
     "macd", "macds", "macdh", "atr",
 )
+
+
+def _tradingview_rows(symbol: str, as_of_date: str) -> pd.DataFrame | None:
+    """TradingView daily bars when it is the first configured price vendor, else None.
+
+    The snapshot is the agents' source of truth for exact prices, so it must read
+    the same feed as ``get_stock_data``; on any TradingView failure it falls back
+    to Yahoo rather than leave the analyst without a snapshot.
+    """
+    from tradingagents.dataflows.config import get_config
+    from tradingagents.dataflows.errors import VendorError
+
+    chain = get_config().get("data_vendors", {}).get("core_stock_apis", "")
+    if chain.split(",")[0].strip() != "tradingview":
+        return None
+    from tradingagents.dataflows.vendors.tradingview_mcp import vendor as tradingview
+    try:
+        return tradingview.load_ohlcv(symbol, as_of_date)
+    except VendorError as exc:
+        logger.warning("TradingView bars unavailable for the snapshot of %s (%s); using Yahoo.", symbol, exc)
+        return None
 
 
 def _verified_rows(symbol: str, as_of_date: str) -> pd.DataFrame:
@@ -37,7 +61,9 @@ def _verified_rows(symbol: str, as_of_date: str) -> pd.DataFrame:
     """
     # As reported: this snapshot is quoted by the agents as exact prices, so a
     # gap-filled cell would put the previous session's number under this date.
-    data = load_ohlcv(symbol, as_of_date, fill_gaps=False)
+    data = _tradingview_rows(symbol, as_of_date)
+    if data is None:
+        data = load_ohlcv(symbol, as_of_date, fill_gaps=False)
     if data is None or data.empty:
         raise NoMarketDataError(symbol, normalize_symbol(symbol), "no price rows")
 

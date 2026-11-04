@@ -41,6 +41,11 @@ dev = [
 bedrock = [
     "langchain-aws>=1.7.9",
 ]
+# TradingView's hosted MCP server as a data vendor (your account, signed in with
+# `tradingagents login tradingview`): pip install "tradingagents[tradingview]".
+tradingview = [
+    "mcp>=2.3",
+]
 
 [project.scripts]
 tradingagents = "cli.main:app"

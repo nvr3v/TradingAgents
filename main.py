@@ -1,4 +1,6 @@
-from tradingagents.default_config import DEFAULT_CONFIG
+from datetime import date
+
+from tradingagents.default_config import DEFAULT_CONFIG, use_tradingview
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 
 # DEFAULT_CONFIG already applies TRADINGAGENTS_* env-var overrides
@@ -20,9 +22,14 @@ config["max_tokens"] = 16384
 # structured decision is lost; LM Studio's grammar-constrained JSON fixes that.
 config["structured_output_method"] = "json_schema"
 
+# Market data from your TradingView account via its hosted MCP server: realtime
+# prices (per your plan), news, fundamentals and macro series, with the default
+# vendors behind it as fallbacks. Sign in once: `tradingagents login tradingview`.
+use_tradingview(config)
+
 # Initialize with custom config
 ta = TradingAgentsGraph(debug=True, config=config)
 
 # forward propagate
-_, decision = ta.propagate("NVDA", "2026-09-01")
+_, decision = ta.propagate("NVDA", date.today().isoformat())
 print(decision)

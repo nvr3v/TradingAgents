@@ -26,6 +26,7 @@ _ENV_OVERRIDES = {
     "TRADINGAGENTS_LLM_MAX_RETRIES":      "llm_max_retries",
     "TRADINGAGENTS_MAX_TOKENS":           "max_tokens",
     "TRADINGAGENTS_STRUCTURED_OUTPUT_METHOD": "structured_output_method",
+    "TRADINGAGENTS_USE_TRADINGVIEW":      "use_tradingview",
     # Provider-specific reasoning/thinking knobs (None = each provider's own
     # default). Settable here for non-interactive runs; the CLI also offers an
     # interactive choice, which is skipped when the matching var is set.
@@ -75,13 +76,32 @@ def _apply_env_overrides(config: dict) -> dict:
     return config
 
 
+# The categories the TradingView vendor serves, and the chain each gets with it.
+# The existing vendors stay behind it as fallbacks, for the methods TradingView
+# lacks (balance sheet, cash flow, insider and global news) and when it fails.
+TRADINGVIEW_VENDORS = {
+    "core_stock_apis": "tradingview,yfinance",
+    "technical_indicators": "tradingview,yfinance",
+    "fundamental_data": "tradingview,sec_edgar,yfinance",
+    "news_data": "tradingview,yfinance",
+    "macro_data": "tradingview,fred",
+}
+
+
+def use_tradingview(config: dict) -> dict:
+    """Route the categories TradingView serves to it first, in place; returns ``config``."""
+    config["use_tradingview"] = True
+    config["data_vendors"] = {**config.get("data_vendors", {}), **TRADINGVIEW_VENDORS}
+    return config
+
+
 def build_default_config() -> dict:
     """The built-in defaults with the TRADINGAGENTS_* environment folded in.
 
     Read when the package is imported, as DEFAULT_CONFIG; call it again to see
     the environment as it is now.
     """
-    return _apply_env_overrides({
+    config = _apply_env_overrides({
         "results_dir": os.getenv("TRADINGAGENTS_RESULTS_DIR") or os.path.join(_TRADINGAGENTS_HOME, "logs"),
         "data_cache_dir": os.getenv("TRADINGAGENTS_CACHE_DIR") or os.path.join(_TRADINGAGENTS_HOME, "cache"),
         "memory_log_path": os.getenv("TRADINGAGENTS_MEMORY_LOG_PATH") or os.path.join(_TRADINGAGENTS_HOME, "memory", "trading_memory.md"),
@@ -129,6 +149,10 @@ def build_default_config() -> dict:
         # model's default. "json_schema" suits local thinking models (LM Studio,
         # vLLM) that answer in prose instead of calling the schema tool.
         "structured_output_method": None,
+        # Put TradingView's hosted MCP server (your own account: realtime prices,
+        # news, fundamentals, macro series) first in the data-vendor chains it
+        # serves, ahead of the defaults. Sign in once: `tradingagents login tradingview`.
+        "use_tradingview": False,
         # Checkpoint/resume: when True, LangGraph saves state after each node
         # so a crashed run can resume from the last successful step.
         "checkpoint_enabled": False,
@@ -210,6 +234,9 @@ def build_default_config() -> dict:
         },
 
     })
+    if config["use_tradingview"]:
+        use_tradingview(config)
+    return config
 
 
 DEFAULT_CONFIG = build_default_config()
