@@ -36,17 +36,21 @@ class NormalizedChatOpenAI(ChatOpenAI):
     stays small.
     """
 
+    # User override of the structured-output method (config
+    # ``structured_output_method``); None keeps the capability table's choice.
+    structured_output_method: str | None = None
+
     def invoke(self, input, config=None, **kwargs):
         return normalize_content(super().invoke(input, config, **kwargs))
 
     def with_structured_output(self, schema, *, method=None, **kwargs):
         caps = get_capabilities(self.model_name)
-        if caps.preferred_structured_method == "none":
+        if caps.preferred_structured_method == "none" and not (method or self.structured_output_method):
             raise NotImplementedError(
                 f"{self.model_name} has no structured-output method available; "
                 f"agent factories will fall back to free-text generation."
             )
-        method = method or caps.preferred_structured_method
+        method = method or self.structured_output_method or caps.preferred_structured_method
         # When the model rejects tool_choice, suppress langchain's hardcoded
         # value. The schema is still bound as a tool — exactly what
         # DeepSeek's official tool-calling examples do.
@@ -63,10 +67,15 @@ class LocalCompatibleChatOpenAI(NormalizedChatOpenAI):
     ``tool_choice`` langchain sends for function-calling structured output. Bind
     the schema as a tool but don't force tool_choice, so structured output works
     across local servers regardless of the model ID's capabilities (#1057).
+
+    Without a forced tool_choice a thinking model may answer in prose instead
+    of calling the tool; servers with grammar-constrained decoding (LM Studio,
+    vLLM, llama.cpp) can set ``structured_output_method="json_schema"`` instead.
     """
 
     def with_structured_output(self, schema, *, method=None, **kwargs):
-        resolved = method or get_capabilities(self.model_name).preferred_structured_method
+        resolved = (method or self.structured_output_method
+                    or get_capabilities(self.model_name).preferred_structured_method)
         if resolved == "function_calling":
             kwargs.setdefault("tool_choice", None)
         return super().with_structured_output(schema, method=method, **kwargs)
@@ -402,6 +411,8 @@ class OpenAIClient(BaseLLMClient):
             if key == "reasoning_effort" and not _supports_reasoning_effort(self.model):
                 continue
             llm_kwargs[key] = self.kwargs[key]
+        if self.kwargs.get("structured_output_method") and issubclass(chat_cls, NormalizedChatOpenAI):
+            llm_kwargs["structured_output_method"] = self.kwargs["structured_output_method"]
 
         # The subclass (provider quirks) comes from the registry spec.
         return chat_cls(**llm_kwargs)

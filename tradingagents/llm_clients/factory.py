@@ -74,6 +74,9 @@ def _coerce_max_retries(value):
     return n
 
 
+_STRUCTURED_METHODS = ("function_calling", "json_mode", "json_schema")
+
+
 def _coerce_max_tokens(value):
     """Validate a ``max_tokens`` value to a positive int (env vars are strings)."""
     if isinstance(value, bool):
@@ -130,6 +133,17 @@ def build_llm_kwargs(config: dict) -> dict[str, Any]:
     if max_tokens is not None and max_tokens != "":
         key = "max_output_tokens" if provider == "google" else "max_tokens"
         kwargs[key] = _coerce_max_tokens(max_tokens)
+
+    # Structured-output method override for the OpenAI-compatible family, e.g.
+    # "json_schema" for a local thinking model that answers in prose instead
+    # of calling the schema tool.
+    method = config.get("structured_output_method")
+    if method:
+        if method not in _STRUCTURED_METHODS:
+            raise ValueError(f"structured_output_method must be one of {_STRUCTURED_METHODS}, got {method!r}")
+        from .openai_client import is_openai_compatible
+        if is_openai_compatible(provider):
+            kwargs["structured_output_method"] = method
 
     return kwargs
 
