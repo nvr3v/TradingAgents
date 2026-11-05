@@ -408,7 +408,10 @@ class OpenAIClient(BaseLLMClient):
         for key in _PASSTHROUGH_KWARGS:
             if key not in self.kwargs:
                 continue
-            if key == "reasoning_effort" and not _supports_reasoning_effort(self.model):
+            # The model-name gate is for native OpenAI; a user's own endpoint
+            # decides for itself what reasoning_effort means.
+            if (key == "reasoning_effort" and self.provider != "openai_compatible"
+                    and not _supports_reasoning_effort(self.model)):
                 continue
             llm_kwargs[key] = self.kwargs[key]
         if self.kwargs.get("structured_output_method") and issubclass(chat_cls, NormalizedChatOpenAI):

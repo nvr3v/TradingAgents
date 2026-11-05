@@ -18,6 +18,9 @@ config["quick_think_llm"] = "qwen/qwen3.5-9b"
 # Qwen 3.5 "thinks" before answering; without a higher cap the server's default
 # 2048-token output limit is used up by reasoning and the answer comes back empty.
 config["max_tokens"] = 16384
+# Turn Qwen's thinking off: LM Studio maps reasoning_effort "none" to no
+# reasoning, which cuts each answer from hundreds of tokens to a handful.
+config["openai_reasoning_effort"] = "none"
 # Without a forced tool call Qwen answers the managers' prompts in prose, so the
 # structured decision is lost; LM Studio's grammar-constrained JSON fixes that.
 config["structured_output_method"] = "json_schema"
