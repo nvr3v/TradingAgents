@@ -65,6 +65,16 @@ def _no_network(request, monkeypatch):
     def refuse(*args, **kwargs):
         raise OSError(f"test tried to reach the network: {args[1:] or kwargs}")
 
+    real_connect, real_socketpair = socket.socket.connect, socket.socketpair
+
+    def socketpair(*args, **kwargs):
+        # On Windows a socket pair is built by connecting over loopback, and every
+        # asyncio event loop makes one, so asyncio.run needs that connect.
+        with pytest.MonkeyPatch.context() as local:
+            local.setattr(socket.socket, "connect", real_connect)
+            return real_socketpair(*args, **kwargs)
+
+    monkeypatch.setattr(socket, "socketpair", socketpair)
     monkeypatch.setattr(socket.socket, "connect", refuse)
     monkeypatch.setattr(socket.socket, "connect_ex", refuse)
     monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: refuse(None, *a))

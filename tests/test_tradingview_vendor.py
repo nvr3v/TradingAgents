@@ -262,3 +262,28 @@ def test_token_expiry_recorded_and_inferred(tmp_path, monkeypatch):
     (tmp_path / "tv.json").write_text(json.dumps(data))
     os.utime(tmp_path / "tv.json", (1000, 1000))
     assert client._token_expiry() == 1900
+
+
+@pytest.mark.unit
+def test_token_storage_off_the_event_loop(tmp_path, monkeypatch):
+    """Under an event loop that forbids blocking calls (``langgraph dev``) a refreshed
+    token must still be saved: the refresh rotates the refresh token, so a failed
+    write leaves the sign-in on disk spent."""
+    import asyncio
+
+    blockbuster = pytest.importorskip("blockbuster")
+    from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
+
+    monkeypatch.setattr(client, "AUTH_FILE", tmp_path / "sub" / "tv.json")
+    storage = client._FileTokenStorage()
+    token = OAuthToken(access_token="a", token_type="Bearer", expires_in=900, refresh_token="r2")
+    info = OAuthClientInformationFull(client_id="xyz", redirect_uris=[client._redirect_uri(client.CALLBACK_PORT)])
+
+    async def roundtrip():
+        await storage.set_client_info(info)
+        await storage.set_tokens(token)
+        return await storage.get_tokens(), await storage.get_client_info()
+
+    with blockbuster.blockbuster_ctx():
+        tokens, saved_info = asyncio.run(roundtrip())
+    assert tokens.refresh_token == "r2" and saved_info.client_id == "xyz"

@@ -95,27 +95,31 @@ def is_signed_in() -> bool:
 
 
 class _FileTokenStorage:
-    """``mcp.client.auth.TokenStorage`` backed by AUTH_FILE."""
+    """``mcp.client.auth.TokenStorage`` backed by AUTH_FILE.
+
+    The file is read and written on a worker thread, off the event loop. An event
+    loop that forbids blocking calls (LangGraph's dev server, ``langgraph dev``)
+    would otherwise fail the write after a refresh, and since each refresh
+    rotates the refresh token, the sign-in on disk would be left spent.
+    """
 
     _lock = threading.Lock()
 
     async def get_tokens(self):
         from mcp.shared.auth import OAuthToken
-        tokens = _read_auth().get("tokens")
+        tokens = (await asyncio.to_thread(_read_auth)).get("tokens")
         return OAuthToken.model_validate(tokens) if tokens else None
 
     async def set_tokens(self, tokens) -> None:
-        with self._lock:
-            data = _read_auth()
-            data["tokens"] = tokens.model_dump(mode="json", exclude_none=True)
-            # The token carries only its lifetime; keep when it lapses, so a later
-            # process knows to refresh instead of sending an expired token.
-            data["expires_at"] = time.time() + tokens.expires_in if tokens.expires_in else None
-            _write_auth(data)
+        dumped = tokens.model_dump(mode="json", exclude_none=True)
+        # The token carries only its lifetime; keep when it lapses, so a later
+        # process knows to refresh instead of sending an expired token.
+        expires_at = time.time() + tokens.expires_in if tokens.expires_in else None
+        await asyncio.to_thread(self._update, tokens=dumped, expires_at=expires_at)
 
     async def get_client_info(self):
         from mcp.shared.auth import OAuthClientInformationFull
-        info = _read_auth().get("client_info")
+        info = (await asyncio.to_thread(_read_auth)).get("client_info")
         # A registration made for another redirect address cannot complete a
         # sign-in here; returning None makes the SDK register afresh.
         if not info or _redirect_uri(CALLBACK_PORT) not in info.get("redirect_uris", []):
@@ -123,9 +127,13 @@ class _FileTokenStorage:
         return OAuthClientInformationFull.model_validate(info)
 
     async def set_client_info(self, client_info) -> None:
-        with self._lock:
+        await asyncio.to_thread(self._update, client_info=client_info.model_dump(mode="json", exclude_none=True))
+
+    @classmethod
+    def _update(cls, **fields) -> None:
+        with cls._lock:
             data = _read_auth()
-            data["client_info"] = client_info.model_dump(mode="json", exclude_none=True)
+            data.update(fields)
             _write_auth(data)
 
 
@@ -254,7 +262,7 @@ def _provider(interactive: bool, say: Callable[[str], None] = print, open_browse
         # minute's margin) so an expired token is refreshed with the refresh token.
         async def _initialize(self) -> None:
             await super()._initialize()
-            expiry = _token_expiry()
+            expiry = await asyncio.to_thread(_token_expiry)
             if self.context.current_tokens and expiry:
                 self.context.token_expiry_time = expiry - REFRESH_MARGIN
                 # A refresh before any 401 needs the metadata the SDK only discovers
