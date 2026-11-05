@@ -1,6 +1,10 @@
 import logging
 from collections import Counter
-from typing import Any, TypedDict
+from typing import Any
+
+# typing_extensions, as in agents/state.py: pydantic (LangGraph's schema export)
+# rejects typing.TypedDict on Python < 3.12.
+from typing_extensions import TypedDict
 
 from langchain_core.messages import HumanMessage
 from langgraph.graph import END, START, StateGraph

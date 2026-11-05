@@ -46,6 +46,11 @@ bedrock = [
 tradingview = [
     "mcp>=2.3",
 ]
+# LangGraph Studio on a local dev server (`langgraph dev`, see langgraph.json):
+# pip install "tradingagents[studio]".
+studio = [
+    "langgraph-cli[inmem]>=0.4.41",
+]
 
 [project.scripts]
 tradingagents = "cli.main:app"
