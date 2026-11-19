@@ -26,7 +26,8 @@ config["openai_reasoning_effort"] = "none"
 config["structured_output_method"] = "json_schema"
 
 # Market data from your TradingView account via its hosted MCP server: realtime
-# prices (per your plan), news, fundamentals and macro series, with the default
+# prices (per your plan), news and macro series (fundamentals come from SEC EDGAR
+# and yfinance: TradingView's MCP server no longer serves them), with the default
 # vendors behind it as fallbacks. Sign in once: `tradingagents login tradingview`.
 use_tradingview(config)
 
