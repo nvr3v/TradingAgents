@@ -1,5 +1,6 @@
 from datetime import date
 
+from local_llm import use_local_model
 from tradingagents.default_config import DEFAULT_CONFIG, use_tradingview
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 
@@ -10,20 +11,8 @@ from tradingagents.graph.trading_graph import TradingAgentsGraph
 # want a hard-coded value that should ignore the environment.
 config = DEFAULT_CONFIG.copy()
 
-# Local Qwen 3.5 9B served by LM Studio (OpenAI-compatible API, no key needed).
-config["llm_provider"] = "openai_compatible"
-config["backend_url"] = "http://192.168.1.246:1234/v1"
-config["deep_think_llm"] = "qwen/qwen3.5-9b"
-config["quick_think_llm"] = "qwen/qwen3.5-9b"
-# Qwen 3.5 "thinks" before answering; without a higher cap the server's default
-# 2048-token output limit is used up by reasoning and the answer comes back empty.
-config["max_tokens"] = 16384
-# Turn Qwen's thinking off: LM Studio maps reasoning_effort "none" to no
-# reasoning, which cuts each answer from hundreds of tokens to a handful.
-config["openai_reasoning_effort"] = "none"
-# Without a forced tool call Qwen answers the managers' prompts in prose, so the
-# structured decision is lost; LM Studio's grammar-constrained JSON fixes that.
-config["structured_output_method"] = "json_schema"
+# Local Qwen 3.6 35B-A3B served by LM Studio; the model and its settings are in local_llm.py.
+use_local_model(config)
 
 # Market data from your TradingView account via its hosted MCP server: realtime
 # prices (per your plan), news, fundamentals and macro series, with the default
