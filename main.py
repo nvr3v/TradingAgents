@@ -15,7 +15,8 @@ config = DEFAULT_CONFIG.copy()
 use_local_model(config)
 
 # Market data from your TradingView account via its hosted MCP server: realtime
-# prices (per your plan), news, fundamentals and macro series, with the default
+# prices (per your plan), news and macro series (fundamentals come from SEC EDGAR
+# and yfinance: TradingView's MCP server no longer serves them), with the default
 # vendors behind it as fallbacks. Sign in once: `tradingagents login tradingview`.
 use_tradingview(config)
 

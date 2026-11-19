@@ -1,25 +1,33 @@
 """TradingView (hosted MCP server) as a TradingAgents data vendor.
 
-Serves the router's ``get_stock_data``, ``get_indicators``, ``get_fundamentals``,
-``get_income_statement``, ``get_news`` and ``get_macro_indicators`` from the
-person's own TradingView account, so prices are realtime where their plan has
-the exchange's data (delayed otherwise). Only read-only tools are called; the
-server's alert and watchlist tools, which change the account, are never used.
+Serves the router's ``get_stock_data``, ``get_indicators``, ``get_news`` and
+``get_macro_indicators`` from the person's own TradingView account, so prices
+are realtime where their plan has the exchange's data (delayed otherwise). Only
+read-only tools are called; the server's alert and watchlist tools, which
+change the account, are never used.
+
+Fundamentals are not served: the server withdrew its financials, financial
+history and forecasts tools, and its symbol-data tools drop fundamentals,
+estimates, earnings and dividends columns. Those come from the next vendors in
+the chain (SEC EDGAR, yfinance).
 
 Errors map onto the router's taxonomy so a configured fallback vendor takes
 over: no sign-in -> ``VendorNotConfiguredError``; a failed or throttled request
 -> ``VendorUnavailableError``; an empty window -> ``NoMarketDataError``.
 
-Point-in-time caveat: bars, news and statement history honour the analysis
-date, but ``get_fundamentals`` is TradingView's *current* snapshot, so it serves
-only analyses dated within ``SNAPSHOT_MAX_AGE_DAYS`` of today; older dates fall
-through to the next vendor rather than leak today's figures into a backtest.
+The account has a call quota (per minute and per day). Daily bars are fetched
+once per symbol and reused for a few minutes, since every indicator reads the
+same history; and once the server reports the quota spent, TradingView is
+skipped until its cooldown ends, rather than spending the run on refused calls.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 
@@ -35,11 +43,13 @@ from . import client
 
 logger = logging.getLogger(__name__)
 
-SNAPSHOT_MAX_AGE_DAYS = 3
 MAX_BARS = 5000
 INDICATOR_WARMUP_DAYS = 400       # history before the window so 200-day averages settle
+BARS_TTL_SECONDS = 600            # how long fetched daily bars are reused
 NEWS_PAGE = 100
+NEWS_MIN_PAGE = 25                # smallest page tried when a large one comes back broken
 NEWS_MAX = 200                    # the server's cap
+QUOTA_COOLDOWN_SECONDS = 600      # when the quota reply names no wait (it has said 10 minutes)
 MACRO_MAX_ROWS = 40
 MACRO_LOOKBACK_DAYS = 365
 MACRO_MIN_HISTORY_DAYS = 550      # enough for the last few quarterly releases
@@ -83,21 +93,60 @@ class TradingViewNotConfiguredError(VendorNotConfiguredError):
     """No TradingView sign-in on this machine."""
 
 
+class TradingViewBadReplyError(VendorUnavailableError):
+    """A reply that does not hold a JSON payload (e.g. one cut short)."""
+
+
 # --- calling the server -----------------------------------------------------------------
+
+_quota_lock = threading.Lock()
+_quota_blocked_until = 0.0   # time.time() before which TradingView is not called
+
+
+def _note_quota(message: str) -> None:
+    """Skip TradingView until the cooldown a quota refusal names (or a default) ends."""
+    global _quota_blocked_until
+    wait = re.search(r"in (\d+)\s*min", message)
+    seconds = int(wait.group(1)) * 60 if wait else QUOTA_COOLDOWN_SECONDS
+    with _quota_lock:
+        _quota_blocked_until = max(_quota_blocked_until, time.time() + seconds)
+    logger.warning("TradingView call quota spent; skipping TradingView until %s",
+                   datetime.fromtimestamp(_quota_blocked_until).strftime("%H:%M"))
+
+
+def _decode(tool: str, text: str):
+    """The JSON payload of a reply, ignoring any text the server put after it."""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    stripped = text.lstrip()
+    try:
+        payload, end = json.JSONDecoder().raw_decode(stripped)
+    except json.JSONDecodeError as exc:
+        raise TradingViewBadReplyError(
+            f"TradingView {tool} returned a reply that is not JSON ({len(text)} chars, {exc}; "
+            f"starts {text[:120]!r}, ends {text[-120:]!r})") from exc
+    if stripped[end:].strip():
+        logger.debug("TradingView %s: text after its JSON reply: %.200s", tool, stripped[end:].strip())
+    return payload
 
 
 def _call(tool: str, arguments: dict) -> dict:
     """Call a read-only tool and return its JSON payload, mapped to vendor errors."""
+    if time.time() < _quota_blocked_until:
+        raise VendorUnavailableError(
+            "TradingView call quota spent; skipping TradingView until "
+            f"{datetime.fromtimestamp(_quota_blocked_until):%H:%M}")
     try:
         text = client.call_tool(tool, arguments)
     except client.TradingViewNotSignedIn as exc:
         raise TradingViewNotConfiguredError(str(exc)) from exc
     except client.TradingViewMCPError as exc:
+        if "TOOL_QUOTA_EXCEEDED" in str(exc):
+            _note_quota(str(exc))
         raise VendorUnavailableError(str(exc)) from exc
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise VendorUnavailableError(f"TradingView {tool} returned non-JSON: {text[:200]}") from exc
+    payload = _decode(tool, text)
     if isinstance(payload, dict) and payload.get("success") is False:
         raise VendorUnavailableError(f"TradingView {tool} failed: {payload.get('error') or payload}")
     return payload
@@ -143,9 +192,17 @@ def _utc_date(ts: int) -> str:
     return (opened + timedelta(days=1) if opened.hour >= 18 else opened).strftime("%Y-%m-%d")
 
 
-def daily_bars(ticker: str, date_from: str, date_to: str) -> pd.DataFrame:
-    """Daily OHLCV between two dates (inclusive), as Date/Open/High/Low/Close/Volume."""
-    symbol = resolve_symbol(ticker)
+# (symbol, date_to) -> (fetched at, date_from fetched, bars): a later request for the
+# same end date and a shorter history is served from these, without a call.
+_bars_cache: dict[tuple[str, str], tuple[float, str, pd.DataFrame]] = {}
+_bars_lock = threading.Lock()
+
+
+def _fetch_bars(ticker: str, symbol: str, date_from: str, date_to: str) -> pd.DataFrame:
+    with _bars_lock:
+        cached = _bars_cache.get((symbol, date_to))
+    if cached and cached[1] <= date_from and time.monotonic() - cached[0] < BARS_TTL_SECONDS:
+        return cached[2]
     # A day early: an evening-UTC session open for date_from is stamped the day before.
     query_from = (pd.to_datetime(date_from) - timedelta(days=1)).strftime("%Y-%m-%d")
     payload = _call("mcp-tv-get-ohlcv", {
@@ -162,6 +219,17 @@ def daily_bars(ticker: str, date_from: str, date_to: str) -> pd.DataFrame:
         "Open": bars["o"], "High": bars["h"], "Low": bars["l"], "Close": bars["c"],
         "Volume": bars.get("v") or [None] * len(bars["t"]),
     })
+    with _bars_lock:
+        _bars_cache[(symbol, date_to)] = (time.monotonic(), date_from, df)
+    return df
+
+
+def daily_bars(ticker: str, date_from: str, date_to: str) -> pd.DataFrame:
+    """Daily OHLCV between two dates (inclusive), as Date/Open/High/Low/Close/Volume."""
+    symbol = resolve_symbol(ticker)
+    # One spelling of each date, so cached windows compare as text.
+    date_from, date_to = (pd.to_datetime(d).strftime("%Y-%m-%d") for d in (date_from, date_to))
+    df = _fetch_bars(ticker, symbol, date_from, date_to)
     df = df[(df["Date"] >= pd.to_datetime(date_from)) & (df["Date"] <= pd.to_datetime(date_to))]
     if df.empty:
         raise NoMarketDataError(ticker, symbol, f"no daily bars between {date_from} and {date_to}")
@@ -222,65 +290,26 @@ def get_indicators(symbol: str, indicator: str, as_of_date: str, look_back_days:
             f"(computed from TradingView daily bars for {resolve_symbol(symbol)}):\n\n" + "\n".join(lines))
 
 
-def _require_recent(ticker: str, as_of_date: str, what: str) -> None:
-    age = (datetime.now().date() - datetime.strptime(as_of_date, "%Y-%m-%d").date()).days
-    if age > SNAPSHOT_MAX_AGE_DAYS:
-        raise VendorUnavailableError(
-            f"TradingView serves only the current {what}; {as_of_date} is {age} days old "
-            "and would leak today's figures into a historical analysis")
-
-
-def get_fundamentals(ticker: str, as_of_date: str) -> str:
-    _require_recent(ticker, as_of_date, "fundamentals snapshot")
-    symbol = resolve_symbol(ticker)
-    fin = _call("mcp-tv-get-financials", {"symbol": symbol}).get("data", {})
-    lines = [f"## Fundamentals for {symbol} (TradingView, current as of {datetime.now():%Y-%m-%d})", ""]
-    lines += [f"- {k}: {_fmt_num(v)}" for k, v in fin.items()]
-    try:
-        fc = _call("mcp-tv-get-forecasts", {"symbol": symbol}).get("data", {})
-    except VendorUnavailableError as exc:
-        logger.warning("TradingView forecasts unavailable for %s: %s", symbol, exc)
-        fc = {}
-    if fc:
-        rating, targets, est = fc.get("analyst_rating", {}), fc.get("price_targets", {}), fc.get("estimates", {})
-        lines += ["", "### Analyst consensus",
-                  f"- recommendation: {rating.get('recommendation')} (score {rating.get('score')}, "
-                  f"{rating.get('total_analysts')} analysts: buy {rating.get('buy')}, overweight "
-                  f"{rating.get('overweight')}, hold {rating.get('hold')}, underweight "
-                  f"{rating.get('underweight')}, sell {rating.get('sell')})",
-                  f"- price targets: average {targets.get('average')}, high {targets.get('high')}, "
-                  f"low {targets.get('low')}, upside {targets.get('upside_pct')}%"]
-        lines += [f"- {k}: {_fmt_num(v)}" for k, v in est.items()]
-    return "\n".join(lines)
-
-
-def get_income_statement(ticker: str, freq: str = "quarterly", as_of_date: str | None = None) -> str:
-    """Reported fundamentals history (revenue through EPS, FCF and debt) up to as_of_date."""
-    symbol = resolve_symbol(ticker)
-    period = "fy" if str(freq).lower().startswith("a") else "fq"
-    args = {"symbol": symbol, "period": period}
-    if as_of_date:
-        args["date_to"] = as_of_date
-    payload = _call("mcp-tv-get-financial-history", args)
-    labels, series = payload.get("labels") or [], payload.get("series") or {}
-    if not labels or not series:
-        raise NoMarketDataError(ticker, symbol, "no reported financial history")
-    table = pd.DataFrame(
-        {name: [_fmt_num(p.get("value")) + (f" ({p['yoy_pct']:+}% YoY)" if p.get("yoy_pct") is not None else "")
-                for p in points] for name, points in series.items()},
-        index=labels[-len(next(iter(series.values()))):],
-    ).T
-    return (f"# {'Annual' if period == 'fy' else 'Quarterly'} reported financials for {symbol} "
-            f"(TradingView){f', reports up to {as_of_date}' if as_of_date else ''}\n\n" + table.to_csv())
+def _news_page(symbol: str, offset: int, page: int) -> tuple[dict, int]:
+    """One page of headlines and the page size that worked: a broken reply to a large
+    page (a long one can come back cut short) is asked again in smaller pages."""
+    while True:
+        try:
+            return _call("mcp-tv-get-news", {"symbol": symbol, "limit": page, "offset": offset}).get("data", {}), page
+        except TradingViewBadReplyError:
+            if page <= NEWS_MIN_PAGE:
+                raise
+            page = max(NEWS_MIN_PAGE, page // 2)
+            logger.warning("TradingView news reply for %s unreadable; retrying with %d headlines", symbol, page)
 
 
 def get_news(ticker: str, start_date: str, end_date: str) -> str:
     symbol = resolve_symbol(ticker)
     start = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=UTC)
     end = datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=UTC) + timedelta(days=1)
-    kept, offset, oldest = [], 0, None
+    kept, offset, oldest, page = [], 0, None, NEWS_PAGE
     while offset < NEWS_MAX:
-        data = _call("mcp-tv-get-news", {"symbol": symbol, "limit": NEWS_PAGE, "offset": offset}).get("data", {})
+        data, page = _news_page(symbol, offset, page)
         headlines = data.get("headlines") or []
         for h in headlines:
             published = datetime.fromtimestamp(h.get("published", 0), UTC)

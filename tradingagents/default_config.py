@@ -78,11 +78,11 @@ def _apply_env_overrides(config: dict) -> dict:
 
 # The categories the TradingView vendor serves, and the chain each gets with it.
 # The existing vendors stay behind it as fallbacks, for the methods TradingView
-# lacks (balance sheet, cash flow, insider and global news) and when it fails.
+# lacks (insider and global news) and when it fails. Fundamentals keep their own
+# chain: TradingView's MCP server no longer serves them.
 TRADINGVIEW_VENDORS = {
     "core_stock_apis": "tradingview,yfinance",
     "technical_indicators": "tradingview,yfinance",
-    "fundamental_data": "tradingview,sec_edgar,yfinance",
     "news_data": "tradingview,yfinance",
     "macro_data": "tradingview,fred",
 }

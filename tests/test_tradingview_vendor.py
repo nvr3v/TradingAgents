@@ -27,21 +27,42 @@ SEARCH = {"data": {"symbols": [
 ]}, "success": True}
 
 
+@pytest.fixture(autouse=True)
+def _fresh_vendor_state(monkeypatch):
+    """Each test starts with no cached symbols or bars and no quota cooldown."""
+    tv.resolve_symbol.cache_clear()
+    tv._bars_cache.clear()
+    monkeypatch.setattr(tv, "_quota_blocked_until", 0.0)
+    yield
+    tv.resolve_symbol.cache_clear()
+    tv._bars_cache.clear()
+
+
 @pytest.fixture
 def server(monkeypatch):
-    """Route call_tool to per-tool handlers; records every call."""
+    """Route call_tool to per-tool handlers; records every call.
+
+    A handler is a payload (sent as JSON), a raw reply string, a callable of the
+    arguments returning either, or an exception to raise.
+    """
     handlers, calls = {}, []
 
     def fake_call(name, arguments):
         calls.append((name, arguments))
         reply = handlers[name]
-        return json.dumps(reply(arguments) if callable(reply) else reply)
+        reply = reply(arguments) if callable(reply) else reply
+        if isinstance(reply, Exception):
+            raise reply
+        return reply if isinstance(reply, str) else json.dumps(reply)
 
     monkeypatch.setattr(client, "call_tool", fake_call)
-    tv.resolve_symbol.cache_clear()
     handlers["mcp-tv-search-symbols"] = SEARCH
     yield handlers, calls
-    tv.resolve_symbol.cache_clear()
+
+
+def _bars(days: list[str], closes: list[float]) -> dict:
+    return {"bars": {"t": [_ts(d, 14, 30) for d in days], "o": closes, "h": closes, "l": closes,
+                     "c": closes, "v": [1] * len(days)}, "success": True}
 
 
 @pytest.mark.unit
@@ -113,19 +134,101 @@ def test_indicator_from_bars(server):
 
 
 @pytest.mark.unit
-def test_fundamentals_snapshot_refuses_old_dates(server):
-    with pytest.raises(VendorUnavailableError, match="leak"):
-        tv.get_fundamentals("NVDA", "2020-01-02")
+def test_indicators_reuse_the_bars_already_fetched(server):
+    """Every indicator reads the same history: one call serves them all."""
+    handlers, calls = server
+    days = [(date(2025, 1, 1) + timedelta(days=i)).isoformat() for i in range(700)]
+    handlers["mcp-tv-get-ohlcv"] = _bars(days, [100.0 + i for i in range(700)])
+    as_of = days[-1]
+    tv.load_ohlcv("NVDA", as_of)                       # the snapshot's two years
+    for indicator in ("close_10_sma", "close_50_sma", "rsi", "macd"):
+        tv.get_indicators("NVDA", indicator, as_of, 30)
+    tv.get_stock_data("NVDA", days[-20], as_of)
+    assert [n for n, _ in calls].count("mcp-tv-get-ohlcv") == 1
 
 
 @pytest.mark.unit
-def test_fundamentals_current(server):
+def test_bars_fetched_again_for_more_history_or_when_stale(server, monkeypatch):
+    handlers, calls = server
+    handlers["mcp-tv-get-ohlcv"] = _bars(["2026-11-03", "2026-11-04"], [1.0, 2.0])
+    tv.get_stock_data("NVDA", "2026-11-03", "2026-11-04")
+    tv.get_stock_data("NVDA", "2026-10-01", "2026-11-04")    # reaches further back
+    assert [n for n, _ in calls].count("mcp-tv-get-ohlcv") == 2
+    now = tv.time.monotonic()
+    monkeypatch.setattr(tv.time, "monotonic", lambda: now + tv.BARS_TTL_SECONDS + 1)
+    tv.get_stock_data("NVDA", "2026-11-03", "2026-11-04")
+    assert [n for n, _ in calls].count("mcp-tv-get-ohlcv") == 3
+
+
+@pytest.mark.unit
+def test_fundamentals_and_statements_are_not_served():
+    """The server withdrew its financials tools; the chain's other vendors serve them."""
+    from tradingagents.dataflows.router import VENDOR_METHODS
+    from tradingagents.default_config import TRADINGVIEW_VENDORS
+
+    for method in ("get_fundamentals", "get_income_statement", "get_balance_sheet", "get_cashflow"):
+        assert "tradingview" not in VENDOR_METHODS[method]
+    assert "fundamental_data" not in TRADINGVIEW_VENDORS
+    assert not hasattr(tv, "get_fundamentals") and not hasattr(tv, "get_income_statement")
+
+
+@pytest.mark.unit
+def test_reply_with_text_after_its_json(server):
     handlers, _ = server
-    handlers["mcp-tv-get-financials"] = {"data": {"price_earnings_ttm": 25.5, "market_cap_basic": 4.8e12}, "success": True}
-    handlers["mcp-tv-get-forecasts"] = {"data": {"analyst_rating": {"recommendation": "Buy", "total_analysts": 3},
-                                                 "price_targets": {"average": 300}, "estimates": {}}, "success": True}
-    out = tv.get_fundamentals("NVDA", date.today().isoformat())
-    assert "price_earnings_ttm: 25.5" in out and "recommendation: Buy" in out
+    handlers["mcp-tv-get-ohlcv"] = json.dumps(_bars(["2026-11-04"], [3.0])) + "\nNote: data delayed 15 minutes."
+    assert "Total records: 1" in tv.get_stock_data("NVDA", "2026-11-04", "2026-11-04")
+
+
+@pytest.mark.unit
+def test_unreadable_reply_names_its_length_and_end(server):
+    handlers, _ = server
+    handlers["mcp-tv-get-ohlcv"] = '{"bars": {"c": [177.75, 174.88'   # cut short
+    with pytest.raises(tv.TradingViewBadReplyError, match=r"not JSON \(30 chars.*ends '.*174\.88'"):
+        tv.get_stock_data("NVDA", "2026-11-03", "2026-11-04")
+
+
+@pytest.mark.unit
+def test_news_retries_a_broken_page_in_smaller_pages(server):
+    handlers, calls = server
+    headline = {"title": "In window", "published": _ts("2026-11-03", 12), "provider": {"name": "P"}, "link": "L"}
+
+    def news(args):
+        if args["limit"] > 25:
+            return '{"data": {"count": 100, "has_more": true, "headlines": [{"id"'   # cut short
+        return {"data": {"has_more": False, "headlines": [headline]}, "success": True}
+    handlers["mcp-tv-get-news"] = news
+    assert "In window" in tv.get_news("NVDA", "2026-11-02", "2026-11-04")
+    assert [a["limit"] for n, a in calls if n == "mcp-tv-get-news"] == [100, 50, 25]
+
+
+@pytest.mark.unit
+def test_quota_refusal_skips_tradingview_until_the_cooldown_ends(server, monkeypatch):
+    handlers, calls = server
+    handlers["mcp-tv-get-ohlcv"] = client.TradingViewMCPError(
+        "TradingView tool mcp-tv-get-ohlcv failed: tool_pre_invoke blocked by plugin ToolQuotaPlugin: "
+        "TOOL_QUOTA_EXCEEDED - Tool call quota exceeded (MCP cooldown is currently active. "
+        "You can make another call in 7 mins, once the cooldown is lifted.)")
+    with pytest.raises(VendorUnavailableError, match="TOOL_QUOTA_EXCEEDED"):
+        tv.get_stock_data("NVDA", "2026-11-03", "2026-11-04")
+    assert tv.time.time() + 6.9 * 60 < tv._quota_blocked_until <= tv.time.time() + 7 * 60
+    made = len(calls)
+    with pytest.raises(VendorUnavailableError, match="skipping TradingView until"):
+        tv.get_news("NVDA", "2026-11-02", "2026-11-04")
+    assert len(calls) == made                               # not called during the cooldown
+    later = tv._quota_blocked_until + 1
+    monkeypatch.setattr(tv.time, "time", lambda: later)
+    handlers["mcp-tv-get-ohlcv"] = _bars(["2026-11-04"], [3.0])
+    assert "Total records: 1" in tv.get_stock_data("NVDA", "2026-11-04", "2026-11-04")
+
+
+@pytest.mark.unit
+def test_quota_refusal_without_a_wait_uses_the_default(server):
+    handlers, _ = server
+    handlers["mcp-tv-get-ohlcv"] = client.TradingViewMCPError(
+        "TOOL_QUOTA_EXCEEDED - Tool call quota exceeded (You've reached your daily usage limit)")
+    with pytest.raises(VendorUnavailableError):
+        tv.get_stock_data("NVDA", "2026-11-03", "2026-11-04")
+    assert tv._quota_blocked_until > tv.time.time() + tv.QUOTA_COOLDOWN_SECONDS - 5
 
 
 @pytest.mark.unit
@@ -193,8 +296,7 @@ def test_use_tradingview_chains(monkeypatch):
     for category, chain in TRADINGVIEW_VENDORS.items():
         assert config["data_vendors"][category] == chain
     assert config["data_vendors"]["prediction_markets"] == "polymarket"  # untouched
-    for method in ("get_stock_data", "get_indicators", "get_fundamentals",
-                   "get_income_statement", "get_news", "get_macro_indicators"):
+    for method in ("get_stock_data", "get_indicators", "get_news", "get_macro_indicators"):
         assert "tradingview" in VENDOR_METHODS[method]
     monkeypatch.setenv("TRADINGAGENTS_USE_TRADINGVIEW", "true")
     assert build_default_config()["data_vendors"]["core_stock_apis"] == "tradingview,yfinance"
