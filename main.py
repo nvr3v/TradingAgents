@@ -1,6 +1,6 @@
 from datetime import date
 
-from local_llm import use_local_model
+from local_llm import ensure_model_loaded, use_local_model
 from tradingagents.default_config import DEFAULT_CONFIG, use_tradingview
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 
@@ -13,6 +13,8 @@ config = DEFAULT_CONFIG.copy()
 
 # Local Qwen 3.6 35B-A3B served by LM Studio; the model and its settings are in local_llm.py.
 use_local_model(config)
+# Load it with a 65536-token context (LM Studio's own first-use load gives 8192).
+ensure_model_loaded()
 
 # Market data from your TradingView account via its hosted MCP server: realtime
 # prices (per your plan), news and macro series (fundamentals come from SEC EDGAR

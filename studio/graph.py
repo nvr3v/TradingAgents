@@ -25,7 +25,7 @@ from langgraph.graph import END, START, StateGraph
 # Not typing's: Studio builds its input form with pydantic, which rejects typing.TypedDict on Python < 3.12.
 from typing_extensions import NotRequired, TypedDict
 
-from local_llm import use_local_model
+from local_llm import ensure_model_loaded, use_local_model
 from tradingagents.agents.state import AgentState
 from tradingagents.default_config import DEFAULT_CONFIG, use_tradingview
 from tradingagents.graph.trading_graph import TradingAgentsGraph
@@ -46,7 +46,12 @@ class RunInput(TypedDict):
 
 
 def prepare_run(state: RunInput) -> dict:
-    """Build the run's initial state, as propagate() does."""
+    """Build the run's initial state, as propagate() does.
+
+    Each run first has LM Studio hold the model with its full context: the
+    server stays up for hours, and LM Studio may unload the model in between.
+    """
+    ensure_model_loaded()
     return ta.create_run_state(
         state["company_of_interest"], state["trade_date"], state.get("asset_type") or "stock"
     )
